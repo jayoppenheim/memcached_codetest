@@ -215,6 +215,7 @@ struct slab_stats {
     uint64_t  cas_badval;
     uint64_t  incr_hits;
     uint64_t  decr_hits;
+    uint64_t  mult_hits;
 };
 
 /**
@@ -229,6 +230,7 @@ struct thread_stats {
     uint64_t          delete_misses;
     uint64_t          incr_misses;
     uint64_t          decr_misses;
+    uint64_t          mult_misses;
     uint64_t          cas_misses;
     uint64_t          bytes_read;
     uint64_t          bytes_written;
@@ -480,6 +482,10 @@ extern struct slab_rebalance slab_rebal;
  * Functions
  */
 void do_accept_new_conns(const bool do_accept);
+enum delta_result_type do_math_delta(conn *c, const char *key,
+                                    const size_t nkey, const uint8_t oper,
+                                    const int64_t delta, char *buf,
+                                    uint64_t *cas, const uint32_t hv);
 enum delta_result_type do_add_delta(conn *c, const char *key,
                                     const size_t nkey, const bool incr,
                                     const int64_t delta, char *buf,

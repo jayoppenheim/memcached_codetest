@@ -981,7 +981,7 @@ static void write_bin_error(conn *c, protocol_binary_response_status err, int sw
         errstr = "Too large.";
         break;
     case PROTOCOL_BINARY_RESPONSE_DELTA_BADVAL:
-        errstr = "Non-numeric server-side value for incr or decr";
+        errstr = "Non-numeric server-side value for incr or decr or mult";
         break;
     case PROTOCOL_BINARY_RESPONSE_NOT_STORED:
         errstr = "Not stored.";
@@ -2989,7 +2989,7 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
     }
 }
 
-static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
+static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const int incr) {
     char temp[INCR_MAX_STORAGE_LEN];
     uint64_t delta;
     char *key;
@@ -3036,6 +3036,107 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
     case DELTA_ITEM_CAS_MISMATCH:
         break; /* Should never get here */
     }
+}
+
+/*
+ * math operation contributing delta value to a numeric item.
+ *
+ * c     connection requesting the operation
+ * it    item to adjust
+ * oper  1 = add, 0 = subtract, 2 = mult
+ * delta amount to adjust value by
+ * buf   buffer for response string
+ *
+ * returns a response string to send back to the client.
+ */
+enum delta_result_type do_math_delta(conn *c, const char *key, const size_t nkey,
+                                    const uint8_t oper, const int64_t delta,
+                                    char *buf, uint64_t *cas,
+                                    const uint32_t hv) {
+    char *ptr;
+    uint64_t value;
+    int res;
+    item *it;
+
+    it = do_item_get(key, nkey, hv);
+    if (!it) {
+        return DELTA_ITEM_NOT_FOUND;
+    }
+
+    if (cas != NULL && *cas != 0 && ITEM_get_cas(it) != *cas) {
+        do_item_remove(it);
+        return DELTA_ITEM_CAS_MISMATCH;
+    }
+
+    ptr = ITEM_data(it);
+
+    if (!safe_strtoull(ptr, &value)) {
+        do_item_remove(it);
+        return NON_NUMERIC;
+    }
+
+    //fprintf(stderr, ">do_math oper %d \n", oper); // debug
+    if (oper == 1) {
+        value += delta;
+        MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
+    } else if (oper == 0) {
+        if(delta > value) {
+            value = 0;
+        } else {
+            value -= delta;
+        }
+        MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
+    } else if (oper == 2) {
+        value *= delta;
+        MEMCACHED_COMMAND_MULT(c->sfd, ITEM_key(it), it->nkey, value);
+
+    } else {
+	    // error unknown operation
+    }
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    if (oper == 1) {
+        c->thread->stats.slab_stats[it->slabs_clsid].incr_hits++;
+    } else if (oper == 0) {
+        c->thread->stats.slab_stats[it->slabs_clsid].decr_hits++;
+    } else if (oper == 2) {
+        c->thread->stats.slab_stats[it->slabs_clsid].mult_hits++;
+    }
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
+    res = strlen(buf);
+    if (res + 2 > it->nbytes || it->refcount != 1) { /* need to realloc */
+        item *new_it;
+        new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2, hv);
+        if (new_it == 0) {
+            do_item_remove(it);
+            return EOM;
+        }
+        memcpy(ITEM_data(new_it), buf, res);
+        memcpy(ITEM_data(new_it) + res, "\r\n", 2);
+        item_replace(it, new_it, hv);
+        // Overwrite the older item's CAS with our new CAS since we're
+        // returning the CAS of the old item below.
+        ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
+        do_item_remove(new_it);       /* release our reference */
+    } else { /* replace in-place */
+        /* When changing the value without replacing the item, we
+           need to update the CAS on the existing item. */
+        mutex_lock(&cache_lock); /* FIXME */
+        ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+        mutex_unlock(&cache_lock);
+
+        memcpy(ITEM_data(it), buf, res);
+        memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
+        do_item_update(it);
+    }
+
+    if (cas) {
+        *cas = ITEM_get_cas(it);    /* swap the incoming CAS value */
+    }
+    do_item_remove(it);         /* release our reference */
+    return OK;
 }
 
 /*
@@ -3272,6 +3373,10 @@ static void process_command(conn *c, char *command) {
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
 
         process_arithmetic_command(c, tokens, ntokens, 0);
+
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "mult") == 0)) {
+
+        process_arithmetic_command(c, tokens, ntokens, 2);
 
     } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
 
@@ -5099,7 +5204,8 @@ int main (int argc, char **argv) {
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
     if (do_daemonize) {
-        if (sigignore(SIGHUP) == -1) {
+        //if (sigignore(SIGHUP) == -1) {
+        if (signal(SIGPIPE,SIG_IGN) == SIG_ERR) {
             perror("Failed to ignore SIGHUP");
         }
         if (daemonize(maxcore, settings.verbose) == -1) {
@@ -5134,7 +5240,8 @@ int main (int argc, char **argv) {
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
      * need that information
      */
-    if (sigignore(SIGPIPE) == -1) {
+    //if (sigignore(SIGPIPE) == -1) {
+    if (signal(SIGPIPE,SIG_IGN) == SIG_ERR) {
         perror("failed to ignore SIGPIPE; sigaction");
         exit(EX_OSERR);
     }
